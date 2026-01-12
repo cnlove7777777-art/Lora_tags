@@ -21,6 +21,8 @@
 
 <img width="1652" height="1006" alt="image" src="https://github.com/user-attachments/assets/a50faf0b-dff6-4573-bb58-c47b47bbb73a" />
 
+<img width="1640" height="505" alt="image" src="https://github.com/user-attachments/assets/3d1d6a4e-95a6-4958-a766-6d87b05d2d9c" />
+
 
 ## 快速开始
 
