@@ -3,15 +3,15 @@
 ###  一键把压缩包里的大量人像/写真整理成可训练的数据集：去重 → 1024 方形裁切 → 关键点辅助 → 自动/半自动打标 → 导出。支持本地部署的多模态模型的调用，专注于隐私保护和高性能处理。
 ### Build training-ready portrait datasets from archives: dedup → square crop → keypoint assist → auto/semi-auto tagging → export.
 ###  Highlights
-- **  Batch import from zip/7z + folder
+-  **  Batch import from zip/7z + folder  ** 
 
-- **Fast dedup (perceptual hash / embedding)
+- **Fast dedup (perceptual hash / embedding)**
 
-- **1024×1024 framing & alignment
+- **1024×1024 framing & alignment**
 
-- **Keypoint-assisted labeling
+- **Keypoint-assisted labeling**
 
-- **Export presets (LoRA/SD, general)
+- **Export presets (LoRA/SD, general)**
 
 #### 目前后端写的是我自己的模搭社区的apikey，大家测试一下然后写自己的就行了（乐）前端设置或者后端写死都可以，开发者有每天两千次的免费调用，但是限额每个模型最多五百次，所以我写了一个满额自己切换的功能。
 
