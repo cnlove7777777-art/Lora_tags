@@ -63,7 +63,9 @@
       <section class="content-card">
         <router-view v-slot="{ Component }">
           <transition name="fade" mode="out-in">
-            <component :is="Component" :key="$route.fullPath" />
+            <keep-alive include="UploadView">
+              <component :is="Component" :key="$route.path" />
+            </keep-alive>
           </transition>
         </router-view>
       </section>

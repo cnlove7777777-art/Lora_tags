@@ -308,19 +308,39 @@
             <div class="dedup-config-title">去重参数（更严格仅保留最优）</div>
             <div class="dedup-config-grid">
               <div class="config-field">
-                <div class="label">人脸相似阈值1</div>
+                <div class="label">人脸特征相似度阈值1</div>
                 <el-input-number v-model="dedupConfig.face_sim_th1" :step="0.01" :min="0" :max="1" />
-                <div class="hint">越低越容易判为重复（默认0.70）</div>
+                <div class="hint">较宽松阈值，用于结合其他条件判断重复（默认0.80）</div>
               </div>
               <div class="config-field">
-                <div class="label">人脸相似阈值2</div>
+                <div class="label">人脸特征相似度阈值2</div>
                 <el-input-number v-model="dedupConfig.face_sim_th2" :step="0.01" :min="0" :max="1" />
-                <div class="hint">次级阈值，默认0.80</div>
+                <div class="hint">严格阈值，达到即判为重复（默认0.85）</div>
               </div>
               <div class="config-field">
                 <div class="label">姿态相似阈值</div>
                 <el-input-number v-model="dedupConfig.pose_sim_th" :step="0.01" :min="0" :max="1" />
-                <div class="hint">越低越严格（默认0.95）</div>
+                <div class="hint">姿态相似度阈值（默认0.98）</div>
+              </div>
+              <div class="config-field">
+                <div class="label">人脸结构相似度阈值1</div>
+                <el-input-number v-model="dedupConfig.face_ssim_th1" :step="0.01" :min="0" :max="1" />
+                <div class="hint">较宽松阈值，用于结合其他条件判断重复（默认0.95）</div>
+              </div>
+              <div class="config-field">
+                <div class="label">人脸结构相似度阈值2</div>
+                <el-input-number v-model="dedupConfig.face_ssim_th2" :step="0.01" :min="0" :max="1" />
+                <div class="hint">严格阈值，结合人脸特征判断（默认0.90）</div>
+              </div>
+              <div class="config-field">
+                <div class="label">边界框中心位置容差</div>
+                <el-input-number v-model="dedupConfig.bbox_tol_c" :step="0.01" :min="0" :max="1" />
+                <div class="hint">边界框中心位置容差（默认0.04）</div>
+              </div>
+              <div class="config-field">
+                <div class="label">边界框大小容差</div>
+                <el-input-number v-model="dedupConfig.bbox_tol_wh" :step="0.01" :min="0" :max="1" />
+                <div class="hint">边界框大小容差（默认0.06）</div>
               </div>
               <div class="config-field">
                 <div class="label">每簇保留数量</div>
@@ -531,6 +551,8 @@ const route = useRoute()
 const router = useRouter()
 
 const loading = ref(false)
+const loadInFlight = ref(false)
+const loadTasksPromise = ref<Promise<void> | null>(null)
 const loadFailCount = ref(0)
 const tasks = ref<Task[]>([])
 const selectedTask = ref<Task | null>(null)
@@ -545,7 +567,18 @@ const activeResultTab = ref('dedup')
 const editingCropId = ref<number | null>(null)
 const cropDraft = ref<Record<number, { cx: number; cy: number; side: number }>>({})
 const savingCrop = ref(false)
-const dedupConfig = ref({
+const dedupKeys = [
+  'face_sim_th1',
+  'face_sim_th2',
+  'pose_sim_th',
+  'face_ssim_th1',
+  'face_ssim_th2',
+  'bbox_tol_c',
+  'bbox_tol_wh',
+  'keep_per_cluster'
+] as const
+
+const defaultDedupConfig = {
   face_sim_th1: 0.8,
   face_sim_th2: 0.85,
   pose_sim_th: 0.98,
@@ -554,7 +587,38 @@ const dedupConfig = ref({
   bbox_tol_c: 0.04,
   bbox_tol_wh: 0.06,
   keep_per_cluster: 2
-})
+}
+
+const globalDedupDefaults = ref({ ...defaultDedupConfig })
+const dedupConfig = ref({ ...defaultDedupConfig })
+
+const buildDedupConfig = (override?: Record<string, any>) => {
+  return { ...globalDedupDefaults.value, ...(override || {}) }
+}
+
+const isSameDedupConfig = (a: Record<string, any>, b: Record<string, any>) => {
+  return dedupKeys.every(key => Number(a[key]) === Number(b[key]))
+}
+
+const applyDedupDefaultsForTask = (task?: Task | null) => {
+  const taskParams = (task?.config as any)?.dedup_params
+  dedupConfig.value = buildDedupConfig(taskParams)
+}
+
+const syncTaskDedupConfig = (task: Task | null, params: Record<string, any>) => {
+  if (!task) return
+  const config = { ...(task.config || {}) }
+  if (isSameDedupConfig(params, globalDedupDefaults.value)) {
+    delete (config as any).dedup_params
+  } else {
+    ;(config as any).dedup_params = { ...params }
+  }
+  task.config = config
+  const idx = tasks.value.findIndex(t => t.id === task.id)
+  if (idx !== -1) {
+    tasks.value[idx].config = config
+  }
+}
 
 // Filter
 const filter = ref({
@@ -571,6 +635,7 @@ const pagination = ref({
 
 // Event sources for real-time updates
 const eventSources = ref<Map<number, EventSource>>(new Map())
+const BULK_CONCURRENCY = 5
 
 // Status and stage options
 const statusOptions = [
@@ -602,51 +667,65 @@ const mergeTasks = (incoming: Task[]) => {
 }
 
 const loadTasks = async (silent = false) => {
+  if (loadInFlight.value && loadTasksPromise.value) return loadTasksPromise.value
+  loadInFlight.value = true
   if (!silent) loading.value = true
-  try {
-    const fresh = await getTasks()
-    mergeTasks(fresh)
-    loadFailCount.value = 0
-    // Subscribe to real-time updates for processing tasks
-    setupEventSources()
-    syncRouteTask()
-  } catch (error) {
-    console.error('Failed to load tasks:', error)
-    loadFailCount.value += 1
-    if (!silent) ElMessage.error('加载任务失败')
-    if (loadFailCount.value >= 3 && refreshTimer.value) {
-      clearInterval(refreshTimer.value)
-      refreshTimer.value = null
-      ElMessage.warning('连续加载失败，已暂停自动刷新，请检查后端或手动刷新')
+  const runner = (async () => {
+    try {
+      const fresh = await getTasks()
+      mergeTasks(fresh)
+      loadFailCount.value = 0
+      // Subscribe to real-time updates for processing tasks
+      setupEventSources()
+      syncRouteTask()
+    } catch (error) {
+      console.error('Failed to load tasks:', error)
+      loadFailCount.value += 1
+      if (!silent) ElMessage.error('加载任务失败')
+      if (loadFailCount.value >= 3 && refreshTimer.value) {
+        clearInterval(refreshTimer.value)
+        refreshTimer.value = null
+        ElMessage.warning('连续加载失败，已暂停自动刷新，请检查后端或手动刷新')
+      }
     }
+  })()
+  loadTasksPromise.value = runner
+  try {
+    await runner
   } finally {
+    loadInFlight.value = false
+    loadTasksPromise.value = null
     if (!silent) loading.value = false
   }
+  return runner
 }
 
 // Setup SSE event sources for processing tasks
 const setupEventSources = () => {
-  // Close existing event sources
+  const processingIds = new Set(tasks.value.filter(t => t.status === 'processing').map(t => t.id))
+
   eventSources.value.forEach((es, taskId) => {
-    es.close()
-    eventSources.value.delete(taskId)
+    if (!processingIds.has(taskId)) {
+      es.close()
+      eventSources.value.delete(taskId)
+    }
   })
-  
-  // Subscribe to processing tasks
-  const processingTasks = tasks.value.filter(t => t.status === 'processing')
-  processingTasks.forEach(task => {
+
+  tasks.value.forEach(task => {
+    if (task.status !== 'processing') return
+    if (eventSources.value.has(task.id)) return
     const es = createEventSource(task.id, (data) => {
       // Update task in list
       const index = tasks.value.findIndex(t => t.id === task.id)
       if (index !== -1) {
         tasks.value[index] = { ...tasks.value[index], ...data }
-        
+
         // Update selected task if it's the same
         if (selectedTask.value?.id === task.id) {
           selectedTask.value = { ...selectedTask.value, ...data }
         }
       }
-      
+
       // Close event source if task is completed or error
       if (data.status === 'completed' || data.status === 'error') {
         const es = eventSources.value.get(task.id)
@@ -763,6 +842,7 @@ const viewTaskDetails = (row: Task, syncRoute = false) => {
   }
   selectedTask.value = row
   dialogVisible.value = true
+  applyDedupDefaultsForTask(row)
   loadTaskImages()
 }
 
@@ -789,6 +869,7 @@ const openTaskById = async (taskId: number) => {
 const closeDialog = () => {
   dialogVisible.value = false
   selectedTask.value = null
+  applyDedupDefaultsForTask(null)
   router.replace({ path: '/tasks', query: {} })
 }
 
@@ -1052,14 +1133,17 @@ const bulkRun = async (action: 'dedup' | 'crop' | 'caption' | 'export') => {
   }
   loading.value = true
   try {
-    const runners: Promise<any>[] = []
-    tasks.value.forEach(t => {
-      if (action === 'dedup') runners.push(triggerDedup(t.id, dedupConfig.value))
-      if (action === 'crop') runners.push(triggerCrop(t.id))
-      if (action === 'caption') runners.push(triggerCaption(t.id))
-      if (action === 'export') runners.push(triggerRunAll(t.id))
-    })
-    await Promise.allSettled(runners)
+    const ids = tasks.value.map(t => t.id)
+    for (let i = 0; i < ids.length; i += BULK_CONCURRENCY) {
+      const batch = ids.slice(i, i + BULK_CONCURRENCY)
+      const runners = batch.map((id) => {
+        if (action === 'dedup') return triggerDedup(id, dedupConfig.value)
+        if (action === 'crop') return triggerCrop(id)
+        if (action === 'caption') return triggerCaption(id)
+        return triggerRunAll(id)
+      })
+      await Promise.allSettled(runners)
+    }
     ElMessage.success('已触发全量操作')
   } catch (e) {
     ElMessage.error('触发失败')
@@ -1100,7 +1184,9 @@ const downloadTask = async (taskId?: number) => {
 const startDedup = async (task: Task) => {
   if (!task || task.status === 'processing') return
   try {
-    await triggerDedup(task.id, dedupConfig.value)
+    const params = { ...dedupConfig.value }
+    syncTaskDedupConfig(task, params)
+    await triggerDedup(task.id, params)
     ElMessage.success('已启动去重')
     loadTasks()
   } catch (error) {
@@ -1145,6 +1231,11 @@ const confirmDelete = async (task: Task) => {
     return
   }
   try {
+    const es = eventSources.value.get(task.id)
+    if (es) {
+      es.close()
+      eventSources.value.delete(task.id)
+    }
     await deleteTask(task.id)
     ElMessage.success('已删除任务')
     if (selectedTask.value?.id === task.id) {
@@ -1175,6 +1266,8 @@ const confirmDeleteAll = async () => {
   }
   loading.value = true
   try {
+    eventSources.value.forEach((es) => es.close())
+    eventSources.value.clear()
     await deleteAllTasks()
     tasks.value = []
     selectedTask.value = null
@@ -1190,7 +1283,9 @@ const confirmDeleteAll = async () => {
 const startRunAll = async (task: Task) => {
   if (!task || task.status === 'processing') return
   try {
-    await triggerRunAll(task.id)
+    const params = { ...dedupConfig.value }
+    syncTaskDedupConfig(task, params)
+    await triggerRunAll(task.id, params)
     ElMessage.success('一键流程已启动')
     loadTasks()
   } catch (error) {
@@ -1204,10 +1299,6 @@ const refreshTasks = () => {
 }
 
 // Watch for task count changes to update event sources
-watch(() => tasks.value.length, () => {
-  setupEventSources()
-})
-
 const disableDedup = computed(() => {
   if (!selectedTask.value) return true
   return selectedTask.value.status === 'processing'
@@ -1255,6 +1346,7 @@ watch(
     if (!newTaskId) {
       dialogVisible.value = false
       selectedTask.value = null
+      applyDedupDefaultsForTask(null)
       return
     }
 
@@ -1316,7 +1408,8 @@ const loadDedupSettings = async () => {
   try {
     const settings = await getProcessingSettings()
     if (settings?.dedup_params) {
-      dedupConfig.value = { ...dedupConfig.value, ...settings.dedup_params }
+      globalDedupDefaults.value = { ...defaultDedupConfig, ...settings.dedup_params }
+      applyDedupDefaultsForTask(selectedTask.value)
     }
   } catch (error) {
     console.warn('加载去重参数失败', error)
@@ -1328,10 +1421,7 @@ onMounted(() => {
   loadTasks()
   loadLogs()
   loadDedupSettings()
-  // Only set up refresh timer if no taskId is in URL initially
-  if (!route.query.taskId) {
-    refreshTimer.value = window.setInterval(() => loadTasks(true), 3000)
-  }
+  refreshTimer.value = window.setInterval(() => loadTasks(true), 3000)
   logsTimer.value = window.setInterval(loadLogs, 4000)
 })
 

@@ -8,7 +8,7 @@ import threading
 import json
 from pathlib import Path
 import sys
-from typing import List, Optional, Dict, Union
+from typing import List, Optional, Dict, Union, Set
 from pydantic import BaseModel
 
 from app.core.config import settings
@@ -18,11 +18,13 @@ from app.models.log import Log, LogLevel
 from app.schemas.task import TaskResponse, TaskBatchResponse, ProgressInfo
 from app.tasks import processing
 from app.api.endpoints import events
-from app.db.database import get_db
+from app.db.database import get_db, SessionLocal
 from app.core.defaults import DEFAULT_DEDUP_PARAMS
 from app.services.app_settings import get_app_settings as load_app_settings, update_app_settings
 from sqlalchemy.exc import OperationalError
 import time
+import hashlib
+import re
 
 # FastAPI app
 app = FastAPI(title=settings.APP_NAME, version=settings.APP_VERSION)
@@ -80,6 +82,61 @@ def _detect_cli_port() -> Optional[int]:
     if sys.argv and "uvicorn" in Path(sys.argv[0]).name.lower():
         return 8000
     return None
+
+
+def _safe_rel_path(filename: str) -> Optional[str]:
+    normalized = filename.replace("\\", "/").lstrip("/")
+    if len(normalized) >= 2 and normalized[1] == ":":
+        normalized = normalized[2:].lstrip("/")
+    parts = [part for part in normalized.split("/") if part not in ("", ".")]
+    if not parts or any(part == ".." for part in parts):
+        return None
+    return os.path.join(*parts)
+
+
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+_SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _is_image_file(filename: str) -> bool:
+    return os.path.splitext(filename)[1].lower() in _IMAGE_EXTS
+
+
+def _sanitize_stem(stem: str) -> str:
+    cleaned = _SAFE_NAME_RE.sub("_", stem).strip("._ ")
+    return cleaned[:80]
+
+
+def _build_safe_name(original_rel: str, used_names: Set[str]) -> str:
+    base = os.path.basename(original_rel)
+    stem, ext = os.path.splitext(base)
+    ext = ext.lower()
+    safe_stem = _sanitize_stem(stem)
+    if not safe_stem:
+        safe_stem = "image"
+    suffix = hashlib.sha1(original_rel.encode("utf-8")).hexdigest()[:8]
+    candidate = f"{safe_stem}__{suffix}{ext}"
+    if candidate in used_names:
+        idx = 1
+        while True:
+            alt = f"{safe_stem}__{suffix}_{idx}{ext}"
+            if alt not in used_names:
+                candidate = alt
+                break
+            idx += 1
+    used_names.add(candidate)
+    return candidate
+
+def _guess_folder_name(files: List[UploadFile]) -> str:
+    for upload in files:
+        rel = upload.filename.replace("\\", "/")
+        parts = [part for part in rel.split("/") if part]
+        if len(parts) > 1:
+            return parts[0]
+    if files:
+        base = files[0].filename.replace("\\", "/").split("/")[-1]
+        return os.path.splitext(base)[0] or "folder_upload"
+    return "folder_upload"
 
 
 @app.on_event("startup")
@@ -141,6 +198,7 @@ class AppSettingsUpdate(BaseModel):
 def _get_task_or_404(db: Session, task_id: int) -> Task:
     task = db.query(Task).filter(Task.id == task_id).first()
     if not task:
+        processing.clear_cancelled(task_id)
         raise HTTPException(status_code=404, detail="Task not found")
     return task
 
@@ -154,6 +212,98 @@ def _add_log(db: Session, message: str, level: LogLevel = LogLevel.INFO, task_id
     log = Log(task_id=task_id, level=level, message=message)
     db.add(log)
     db.commit()
+
+
+def _delete_task_dirs(task_dirs: List[str], attempts: int = 6, delay: float = 0.5) -> None:
+    remaining = [path for path in task_dirs if path]
+    for _ in range(attempts):
+        if not remaining:
+            return
+        next_remaining = []
+        for path in remaining:
+            try:
+                shutil.rmtree(path)
+            except Exception:
+                next_remaining.append(path)
+        remaining = next_remaining
+        if remaining:
+            time.sleep(delay)
+    for path in remaining:
+        try:
+            shutil.rmtree(path, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _clear_tasks_root() -> None:
+    base = "./data/tasks"
+    try:
+        if os.path.isdir(base):
+            task_dirs = [os.path.join(base, name) for name in os.listdir(base)]
+            _delete_task_dirs(task_dirs)
+    except Exception:
+        pass
+
+
+def _force_clear_db() -> None:
+    db = SessionLocal()
+    try:
+        attempts = 0
+        while attempts < 30:
+            try:
+                db.query(Image).delete(synchronize_session=False)
+                db.query(Log).delete(synchronize_session=False)
+                db.query(Task).delete(synchronize_session=False)
+                db.commit()
+                return
+            except OperationalError as exc:
+                db.rollback()
+                attempts += 1
+                if "locked" in str(exc).lower():
+                    time.sleep(0.5)
+                    continue
+                return
+            except Exception:
+                db.rollback()
+                return
+    finally:
+        db.close()
+
+
+def _force_delete_all() -> None:
+    try:
+        _force_clear_db()
+        _clear_tasks_root()
+    finally:
+        processing.clear_cancel_all()
+
+
+def _force_delete_task(task_id: int) -> None:
+    db = SessionLocal()
+    try:
+        attempts = 0
+        while attempts < 30:
+            try:
+                db.query(Image).filter(Image.task_id == task_id).delete(synchronize_session=False)
+                db.query(Log).filter(Log.task_id == task_id).delete(synchronize_session=False)
+                db.query(Task).filter(Task.id == task_id).delete(synchronize_session=False)
+                db.commit()
+                break
+            except OperationalError as exc:
+                db.rollback()
+                attempts += 1
+                if "locked" in str(exc).lower():
+                    time.sleep(0.5)
+                    continue
+                break
+            except Exception:
+                db.rollback()
+                break
+    finally:
+        task_dir = os.path.join("./data/tasks", str(task_id))
+        _delete_task_dirs([task_dir])
+        processing.clear_cancelled(task_id)
+        db.close()
 
 
 def _reset_task_data(task: Task, db: Session):
@@ -351,7 +501,111 @@ async def create_task(
     db.commit()
 
     # Start initial prepare step only
-    threading.Thread(target=lambda: processing.prepare_task(task.id), daemon=True).start()
+    processing.submit_task(processing.prepare_task, task.id)
+
+    task.progress_detail = _stage_meta(task)
+    task.export_ready = False
+    return task
+
+
+@app.post("/api/tasks/folder", response_model=TaskResponse)
+async def create_folder_task(
+    files: List[UploadFile] = File(...),
+    folder_name: Optional[str] = Form(None),
+    focus_model: Optional[str] = Form(settings.FOCUS_MODEL),
+    tag_model: Optional[str] = Form(settings.TAG_MODEL),
+    api_key: Optional[str] = Form(None),
+    base_url: Optional[str] = Form(None),
+    request: Request = None,
+    db: Session = Depends(get_db)
+):
+    if not files:
+        raise HTTPException(status_code=400, detail="No files uploaded")
+
+    header_base = request.headers.get("X-Ext-Base-Url")
+    header_key = request.headers.get("X-Ext-Api-Key")
+    header_models = request.headers.get("X-Ext-Models")
+    use_custom = bool(header_base or header_key or header_models)
+
+    if header_base:
+        base_url = header_base
+    if header_key:
+        api_key = header_key
+
+    task_name = folder_name or _guess_folder_name(files)
+
+    task = Task(
+        name=task_name,
+        status=TaskStatus.PROCESSING,
+        focus_model=focus_model,
+        tag_model=tag_model,
+        api_key=api_key,
+        base_url=base_url,
+        config={
+            "base_url_source": "custom" if use_custom else "default",
+            "model_priority": header_models,
+            "input_type": "folder",
+        },
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+
+    task_dir = f"./data/tasks/{task.id}"
+    unpack_dir = os.path.join(task_dir, "unpack")
+    previews_dir = os.path.join(task_dir, "previews")
+    crops_dir = os.path.join(task_dir, "crops")
+    images_dir = os.path.join(crops_dir, "images")
+    txt_dir = os.path.join(crops_dir, "txt")
+    export_dir = os.path.join(task_dir, "export")
+
+    for dir_path in [task_dir, unpack_dir, previews_dir, crops_dir, images_dir, txt_dir, export_dir]:
+        os.makedirs(dir_path, exist_ok=True)
+
+    file_size = 0
+    max_size = settings.MAX_UPLOAD_MB * 1024 * 1024
+    saved_files = 0
+    used_names: Set[str] = set()
+
+    for upload in files:
+        safe_rel = _safe_rel_path(upload.filename)
+        if not safe_rel:
+            _add_log(db, f"跳过非法路径: {upload.filename}", LogLevel.WARNING, task.id)
+            continue
+        if not _is_image_file(safe_rel):
+            try:
+                await upload.close()
+            except Exception:
+                pass
+            continue
+
+        safe_name = _build_safe_name(safe_rel, used_names)
+        target_path = os.path.join(unpack_dir, safe_name)
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+
+        with open(target_path, "wb") as buffer:
+            while True:
+                chunk = await upload.read(1024 * 1024)
+                if not chunk:
+                    break
+                file_size += len(chunk)
+                if file_size > max_size:
+                    _add_log(db, f"上传失败：{task_name} 超出大小限制 {settings.MAX_UPLOAD_MB}MB", LogLevel.ERROR, task.id)
+                    raise HTTPException(status_code=413, detail="Folder upload too large")
+                buffer.write(chunk)
+        saved_files += 1
+
+    if saved_files == 0:
+        raise HTTPException(status_code=400, detail="No valid files to save")
+
+    task.upload_path = None
+    task.status = TaskStatus.PROCESSING
+    task.stage = TaskStage.UNPACKING
+    task.progress = 0
+    task.message = "Upload completed, preparing files..."
+    db.commit()
+
+    processing.submit_task(processing.prepare_task, task.id)
 
     task.progress_detail = _stage_meta(task)
     task.export_ready = False
@@ -434,7 +688,7 @@ async def create_batch_tasks(
         db.commit()
 
         # Kick off prepare step
-        threading.Thread(target=lambda: processing.prepare_task(task.id), daemon=True).start()
+        processing.submit_task(processing.prepare_task, task.id)
 
         results.append({"id": task.id, "zip_name": file.filename})
 
@@ -521,7 +775,16 @@ def update_crop(task_id: int, item_id: int, payload: CropUpdatePayload, db: Sess
 
 
 @app.delete("/api/tasks/{task_id}")
-def delete_task(task_id: int, db: Session = Depends(get_db)):
+def delete_task(
+    task_id: int,
+    force: bool = Query(True),
+    db: Session = Depends(get_db)
+):
+    processing.cancel_task(task_id)
+    if force:
+        threading.Thread(target=_force_delete_task, args=(task_id,), daemon=True).start()
+        return {"deleted": task_id, "force": True, "async": True}
+
     task = db.query(Task).filter(Task.id == task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -540,17 +803,25 @@ def delete_task(task_id: int, db: Session = Depends(get_db)):
                 time.sleep(0.2)
                 continue
             raise
-    # Remove files on disk
+    # Remove files on disk asynchronously
     task_dir = os.path.join("./data/tasks", str(task_id))
-    try:
-        shutil.rmtree(task_dir, ignore_errors=True)
-    except Exception:
-        pass
-    return {"deleted": task_id, "db_removed": attempts < 3}
+    threading.Thread(target=_delete_task_dirs, args=([task_dir],), daemon=True).start()
+    db_removed = attempts < 3
+    if db_removed:
+        processing.clear_cancelled(task_id)
+    return {"deleted": task_id, "db_removed": db_removed}
 
 
 @app.delete("/api/tasks")
-def delete_all_tasks(db: Session = Depends(get_db)):
+def delete_all_tasks(
+    force: bool = Query(True),
+    db: Session = Depends(get_db)
+):
+    if force:
+        processing.cancel_all_tasks()
+        threading.Thread(target=_force_delete_all, daemon=True).start()
+        return {"deleted": "all", "force": True, "async": True}
+
     tasks = db.query(Task).all()
     ids = [t.id for t in tasks]
     if ids:
@@ -569,33 +840,40 @@ def delete_all_tasks(db: Session = Depends(get_db)):
                     time.sleep(0.3)
                     continue
                 raise
-    # remove files
+    # remove files asynchronously
     base = "./data/tasks"
-    try:
-        for tid in ids:
-            shutil.rmtree(os.path.join(base, str(tid)), ignore_errors=True)
-    except Exception:
-        pass
-    return {"deleted": ids}
+    task_dirs = [os.path.join(base, str(tid)) for tid in ids]
+    threading.Thread(target=_delete_task_dirs, args=(task_dirs,), daemon=True).start()
+    return {"deleted": ids, "force": False}
 
 @app.post("/api/tasks/{task_id}/dedup")
 def start_dedup(task_id: int, payload: Optional[DedupParamsPayload] = None, db: Session = Depends(get_db)):
     task = _get_task_or_404(db, task_id)
     _assert_idle(task)
-    
+
+    settings = load_app_settings(db)
+    global_dedup = settings["dedup_params"]
     if payload:
         dedup_params = payload.model_dump()
     else:
-        dedup_params = load_app_settings(db)["dedup_params"]
+        dedup_params = global_dedup
+
+    if task.config is None:
+        task.config = {}
+    if dedup_params == global_dedup:
+        task.config.pop("dedup_params", None)
+    else:
+        task.config["dedup_params"] = dedup_params
     
     # reset previous outputs for this task
     _reset_task_data(task, db)
+    db.commit()
     
     # Start dedup with params
     def _run():
         processing.prepare_task(task_id)
         processing.dedup_task(task_id, dedup_params=dedup_params)
-    threading.Thread(target=_run, daemon=True).start()
+    processing.submit_task(_run, task_id=task_id)
     return {"status": "started", "stage": "de_duplication", "params": dedup_params, "reset": True}
 
 
@@ -603,7 +881,7 @@ def start_dedup(task_id: int, payload: Optional[DedupParamsPayload] = None, db: 
 def start_crop(task_id: int, db: Session = Depends(get_db)):
     task = _get_task_or_404(db, task_id)
     _assert_idle(task)
-    threading.Thread(target=lambda: processing.crop_task(task_id), daemon=True).start()
+    processing.submit_task(processing.crop_task, task_id)
     return {"status": "started", "stage": "cropping"}
 
 
@@ -611,15 +889,28 @@ def start_crop(task_id: int, db: Session = Depends(get_db)):
 def start_caption(task_id: int, db: Session = Depends(get_db)):
     task = _get_task_or_404(db, task_id)
     _assert_idle(task)
-    threading.Thread(target=lambda: processing.caption_task(task_id), daemon=True).start()
+    processing.submit_task(processing.caption_task, task_id)
     return {"status": "started", "stage": "caption"}
 
 
 @app.post("/api/tasks/{task_id}/run-all")
-def run_all(task_id: int, db: Session = Depends(get_db)):
+def run_all(task_id: int, payload: Optional[DedupParamsPayload] = None, db: Session = Depends(get_db)):
     task = _get_task_or_404(db, task_id)
     _assert_idle(task)
-    threading.Thread(target=lambda: processing.run_full_pipeline(task_id), daemon=True).start()
+
+    if payload:
+        settings = load_app_settings(db)
+        global_dedup = settings["dedup_params"]
+        dedup_params = payload.model_dump()
+        if task.config is None:
+            task.config = {}
+        if dedup_params == global_dedup:
+            task.config.pop("dedup_params", None)
+        else:
+            task.config["dedup_params"] = dedup_params
+        db.commit()
+
+    processing.submit_task(processing.run_full_pipeline, task_id)
     return {"status": "started", "stage": "full"}
 
 

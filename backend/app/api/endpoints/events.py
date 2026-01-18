@@ -1,17 +1,15 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from sqlalchemy.orm import Session
 import asyncio
 import json
 from app.models.task import Task, TaskStage, TaskStatus
-from app.core.config import settings
-from app.db.database import get_db
+from app.db.database import SessionLocal
 from app.schemas.task import ProgressInfo
 
 router = APIRouter()
 
 
-async def event_generator(task_id: int, db):
+async def event_generator(task_id: int):
     """Generate SSE events for task progress"""
     last_progress = -1
     last_stage = ""
@@ -60,7 +58,11 @@ async def event_generator(task_id: int, db):
     
     while True:
         # Get current task status
-        task = db.query(Task).filter(Task.id == task_id).first()
+        db = SessionLocal()
+        try:
+            task = db.query(Task).filter(Task.id == task_id).first()
+        finally:
+            db.close()
         if not task:
             yield f"event: error\ndata: {json.dumps({'message': 'Task not found'})}\n\n"
             break
@@ -113,17 +115,18 @@ async def event_generator(task_id: int, db):
 
 
 @router.get("/tasks/{task_id}/events")
-async def get_task_events(
-    task_id: int,
-    db = Depends(get_db)
-):
+async def get_task_events(task_id: int):
     """Get real-time task progress via SSE"""
     # Check if task exists
-    task = db.query(Task).filter(Task.id == task_id).first()
+    db = SessionLocal()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+    finally:
+        db.close()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     
     return StreamingResponse(
-        event_generator(task_id, db),
+        event_generator(task_id),
         media_type="text/event-stream"
     )

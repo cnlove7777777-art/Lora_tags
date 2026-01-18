@@ -134,7 +134,44 @@ export const uploadTask = async (
     headers: {
       'Content-Type': 'multipart/form-data'
     },
-    onUploadProgress
+    onUploadProgress,
+    timeout: 0
+  })
+
+  return response.data
+}
+
+export const uploadFolderTask = async (
+  folderName: string,
+  files: File[],
+  focus_model: string,
+  tag_model: string,
+  onUploadProgress?: (progressEvent: any) => void
+): Promise<Task> => {
+  const formData = new FormData()
+  const settings = getAppSettings()
+
+  files.forEach(file => {
+    const relativePath = (file as any).webkitRelativePath || file.name
+    formData.append('files', file, relativePath)
+  })
+  formData.append('folder_name', folderName)
+  formData.append('focus_model', focus_model)
+  formData.append('tag_model', tag_model)
+
+  if (settings.apiKey) {
+    formData.append('api_key', settings.apiKey)
+  }
+  if (settings.baseUrl) {
+    formData.append('base_url', settings.baseUrl)
+  }
+
+  const response = await api.post<Task>('/tasks/folder', formData, {
+    headers: {
+      'Content-Type': 'multipart/form-data'
+    },
+    onUploadProgress,
+    timeout: 0
   })
 
   return response.data
@@ -167,7 +204,8 @@ export const uploadBatchTasks = async (
     headers: {
       'Content-Type': 'multipart/form-data'
     },
-    onUploadProgress
+    onUploadProgress,
+    timeout: 0
   })
 
   return response.data
@@ -198,12 +236,18 @@ export const downloadTask = async (taskId: number): Promise<void> => {
   window.URL.revokeObjectURL(url)
 }
 
-export const deleteTask = async (taskId: number) => {
-  return api.delete(`/tasks/${taskId}`)
+export const deleteTask = async (taskId: number, force = true) => {
+  return api.delete(`/tasks/${taskId}`, {
+    params: force ? { force: true } : undefined,
+    timeout: 0
+  })
 }
 
-export const deleteAllTasks = async () => {
-  return api.delete(`/tasks`)
+export const deleteAllTasks = async (force = true) => {
+  return api.delete(`/tasks`, {
+    params: force ? { force: true } : undefined,
+    timeout: 0
+  })
 }
 export const getTaskImages = async (taskId: number, selected?: boolean): Promise<TaskImage[]> => {
   const params: any = {}
@@ -245,8 +289,8 @@ export const triggerCaption = async (taskId: number) => {
   return api.post(`/tasks/${taskId}/caption`)
 }
 
-export const triggerRunAll = async (taskId: number) => {
-  return api.post(`/tasks/${taskId}/run-all`)
+export const triggerRunAll = async (taskId: number, dedupParams?: any) => {
+  return api.post(`/tasks/${taskId}/run-all`, dedupParams ?? undefined)
 }
 
 export const updateImageSelection = async (taskId: number, imageIds: number[], selected: boolean) => {

@@ -22,7 +22,7 @@
       <el-timeline-item
         v-for="(file, index) in uploadingFiles"
         :key="index"
-        :timestamp="formatTime(file.file.lastModified)"
+        :timestamp="formatTime(file.lastModified)"
         :type="getFileStatusType(file.status)"
       >
         <div class="timeline-content">
@@ -30,8 +30,8 @@
             <el-icon class="file-icon">
               <Document />
             </el-icon>
-            <span class="file-name">{{ file.relativePath || file.file.name }}</span>
-            <span class="file-size">({{ formatSize(file.file.size) }})</span>
+            <span class="file-name">{{ file.displayName }}</span>
+            <span class="file-size">({{ formatSize(file.totalSize) }})</span>
           </div>
           
           <el-progress
@@ -91,14 +91,14 @@ import {
   CircleClose, 
   Clock 
 } from '@element-plus/icons-vue'
-import type { UploadFile } from '../types/upload'
+import type { UploadItem } from '../types/upload'
 
 defineProps<{
-  uploadingFiles: UploadFile[]
+  uploadingFiles: UploadItem[]
 }>()
 
 const emit = defineEmits<{
-  (e: 'retry', file: UploadFile): void
+  (e: 'retry', file: UploadItem): void
   (e: 'clear'): void
 }>()
 
@@ -145,7 +145,7 @@ const clearQueue = () => {
   emit('clear')
 }
 
-const retryUpload = (file: UploadFile) => {
+const retryUpload = (file: UploadItem) => {
   emit('retry', file)
 }
 

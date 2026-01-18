@@ -5,7 +5,9 @@ import zipfile
 import hashlib
 import json
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from PIL import Image as PILImage
 from PIL import ImageFile, ImageOps
@@ -29,6 +31,62 @@ from app.services.model_client import ModelClient
 from .celery_app import celery_app
 
 logger = logging.getLogger(__name__)
+
+# Global task cancel token to force-stop running tasks.
+_CANCEL_LOCK = threading.Lock()
+_CANCEL_VERSION = 0
+_CANCEL_ALL_ACTIVE = False
+_CANCELLED_TASKS: Set[int] = set()
+
+
+def bump_cancel_version() -> int:
+    global _CANCEL_VERSION
+    with _CANCEL_LOCK:
+        _CANCEL_VERSION += 1
+        return _CANCEL_VERSION
+
+
+def get_cancel_version() -> int:
+    with _CANCEL_LOCK:
+        return _CANCEL_VERSION
+
+
+def cancel_task(task_id: int) -> None:
+    with _CANCEL_LOCK:
+        _CANCELLED_TASKS.add(task_id)
+
+
+def cancel_all_tasks() -> int:
+    global _CANCEL_VERSION, _CANCEL_ALL_ACTIVE
+    with _CANCEL_LOCK:
+        _CANCEL_VERSION += 1
+        _CANCEL_ALL_ACTIVE = True
+        _CANCELLED_TASKS.clear()
+        return _CANCEL_VERSION
+
+
+def clear_cancel_all() -> None:
+    global _CANCEL_ALL_ACTIVE
+    with _CANCEL_LOCK:
+        _CANCEL_ALL_ACTIVE = False
+
+
+def clear_cancelled(task_id: int) -> None:
+    with _CANCEL_LOCK:
+        _CANCELLED_TASKS.discard(task_id)
+
+
+def _should_cancel(task_id: int, version: int) -> bool:
+    with _CANCEL_LOCK:
+        if _CANCEL_ALL_ACTIVE:
+            return True
+        if version != _CANCEL_VERSION:
+            return True
+        return task_id in _CANCELLED_TASKS
+
+# Global task executor to limit concurrent heavy processing.
+_MAX_PARALLEL_TASKS = max(1, int(getattr(settings, "MAX_PARALLEL_TASKS", 5)))
+_TASK_EXECUTOR = ThreadPoolExecutor(max_workers=_MAX_PARALLEL_TASKS)
 
 # Create database engine
 connect_args = {}
@@ -75,8 +133,42 @@ def _mark_error(db, task: Task, message: str) -> None:
     _add_log(db, task.id, LogLevel.CRITICAL, message)
 
 
+def _mark_canceled(db, task: Task) -> None:
+    task.status = TaskStatus.ERROR
+    task.stage = TaskStage.FINISHED
+    task.message = "Canceled"
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
+def _check_cancel(db, task: Task, task_id: int, version: int) -> bool:
+    if _should_cancel(task_id, version):
+        _mark_canceled(db, task)
+        clear_cancelled(task_id)
+        return True
+    return False
+
+
 def _load_images(db, task_id: int) -> List[Image]:
     return db.query(Image).filter(Image.task_id == task_id).all()
+
+
+def submit_task(func, *args, task_id: Optional[int] = None, **kwargs):
+    inferred_id = task_id
+    if inferred_id is None and args:
+        candidate = args[0]
+        if isinstance(candidate, int):
+            inferred_id = candidate
+    cancel_version = get_cancel_version()
+
+    def _runner():
+        if inferred_id is not None and _should_cancel(inferred_id, cancel_version):
+            return
+        return func(*args, **kwargs)
+
+    return _TASK_EXECUTOR.submit(_runner)
 
 
 def prepare_task(task_id: int) -> None:
@@ -85,6 +177,9 @@ def prepare_task(task_id: int) -> None:
     try:
         task = db.query(Task).filter(Task.id == task_id).first()
         if not task:
+            return
+        cancel_version = get_cancel_version()
+        if _check_cancel(db, task, task_id, cancel_version):
             return
 
         dirs = _ensure_task_dirs(task_id)
@@ -101,8 +196,12 @@ def prepare_task(task_id: int) -> None:
                 unpacked_files.append(os.path.join(root, fname))
 
         if not unpacked_files:
+            if not task.upload_path or not os.path.exists(task.upload_path):
+                raise ValueError("No uploaded archive or unpacked files found")
             with zipfile.ZipFile(task.upload_path, "r") as zip_ref:
                 for member in zip_ref.infolist():
+                    if _check_cancel(db, task, task_id, cancel_version):
+                        return
                     if member.filename.startswith("../") or "..\\" in member.filename:
                         continue
                     if member.is_dir():
@@ -130,6 +229,8 @@ def prepare_task(task_id: int) -> None:
         existing = {img.orig_path: img for img in _load_images(db, task_id)}
 
         for idx, img_path in enumerate(image_files):
+            if _check_cancel(db, task, task_id, cancel_version):
+                return
             try:
                 preview_path = generate_preview(
                     img_path,
@@ -171,6 +272,8 @@ def prepare_task(task_id: int) -> None:
                 w, h = (0, 0)
                 _add_log(db, task_id, LogLevel.ERROR, f"获取图片尺寸失败 {img_path}: {exc}")
 
+        if _check_cancel(db, task, task_id, cancel_version):
+            return
         task.status = TaskStatus.PENDING
         task.stage = TaskStage.PREVIEW_GENERATION
         task.progress = max(task.progress, 30)
@@ -222,18 +325,26 @@ def dedup_task(task_id: int, auto_continue: bool = False, dedup_params: dict = N
         task = db.query(Task).filter(Task.id == task_id).first()
         if not task:
             return
+        cancel_version = get_cancel_version()
+        if _check_cancel(db, task, task_id, cancel_version):
+            return
 
         task.status = TaskStatus.PROCESSING
         task.stage = TaskStage.DE_DUPLICATION
         task.progress = max(task.progress, 35)
         task.message = "去重中..."
         db.commit()
+        if _check_cancel(db, task, task_id, cancel_version):
+            return
 
         images = _load_images(db, task_id)
         image_paths = [img.orig_path for img in images if img.orig_path]
         
         if not image_paths:
             raise ValueError("No images found for deduplication")
+
+        if _check_cancel(db, task, task_id, cancel_version):
+            return
         
         # Import dedup_people here to avoid circular imports
         from app.services.dedup_people import extract_features, cluster, pick_kept, _cosine_sim, _face_ssim
@@ -246,6 +357,9 @@ def dedup_task(task_id: int, auto_continue: bool = False, dedup_params: dict = N
             min_pose_conf=0.35,
             max_workers=4,
         )
+
+        if _check_cancel(db, task, task_id, cancel_version):
+            return
         
         # Set default params if not provided
         if dedup_params is None:
@@ -263,6 +377,9 @@ def dedup_task(task_id: int, auto_continue: bool = False, dedup_params: dict = N
             bbox_tol_wh=dedup_params.get("bbox_tol_wh", 0.06),
             face_crop_expand=1.2,
         )
+
+        if _check_cancel(db, task, task_id, cancel_version):
+            return
     
         # Pick kept images
         kept_indices = pick_kept(
@@ -303,6 +420,8 @@ def dedup_task(task_id: int, auto_continue: bool = False, dedup_params: dict = N
         logger.info(f"Dedup Task {task_id}: Clusters: {len(clusters)}, Kept images: {len(kept_indices)}, Total images: {len(metas)}")
 
         for idx, img in enumerate(images):
+            if _check_cancel(db, task, task_id, cancel_version):
+                return
             if not img.orig_path:
                 continue
                 
@@ -366,6 +485,8 @@ def dedup_task(task_id: int, auto_continue: bool = False, dedup_params: dict = N
             db.commit()
 
         task.progress = max(task.progress, 50)
+        if _check_cancel(db, task, task_id, cancel_version):
+            return
         if auto_continue:
             db.commit()
             db.close()
@@ -393,6 +514,9 @@ def crop_task(task_id: int, auto_continue: bool = False) -> None:
         task = db.query(Task).filter(Task.id == task_id).first()
         if not task:
             return
+        cancel_version = get_cancel_version()
+        if _check_cancel(db, task, task_id, cancel_version):
+            return
 
         dirs = _ensure_task_dirs(task_id)
         task.status = TaskStatus.PROCESSING
@@ -400,6 +524,8 @@ def crop_task(task_id: int, auto_continue: bool = False) -> None:
         task.progress = max(task.progress, 55)
         task.message = "检测主体并计算裁切框..."
         db.commit()
+        if _check_cancel(db, task, task_id, cancel_version):
+            return
 
         model_client = ModelClient(
             api_key=task.api_key or settings.MODELSCOPE_TOKEN,
@@ -411,6 +537,8 @@ def crop_task(task_id: int, auto_continue: bool = False) -> None:
         total = max(1, len(images))
 
         for idx, image in enumerate(images):
+            if _check_cancel(db, task, task_id, cancel_version):
+                return
             try:
                 focus_result = model_client.get_focus_point(image.preview_path or image.orig_path)
                 meta = image.meta_json or {}
@@ -494,6 +622,8 @@ def crop_task(task_id: int, auto_continue: bool = False) -> None:
         task.stats = task.stats or {}
         task.stats["processed_files"] = len([img for img in images if img.crop_path and img.selected])
 
+        if _check_cancel(db, task, task_id, cancel_version):
+            return
         if auto_continue:
             db.commit()
             db.close()
@@ -522,6 +652,9 @@ def caption_task(task_id: int) -> None:
         task = db.query(Task).filter(Task.id == task_id).first()
         if not task:
             return
+        cancel_version = get_cancel_version()
+        if _check_cancel(db, task, task_id, cancel_version):
+            return
 
         dirs = _ensure_task_dirs(task_id)
         task.status = TaskStatus.PROCESSING
@@ -529,6 +662,8 @@ def caption_task(task_id: int) -> None:
         task.progress = max(task.progress, 75)
         task.message = "生成训练提示词..."
         db.commit()
+        if _check_cancel(db, task, task_id, cancel_version):
+            return
 
         caption_prompt = get_app_settings(db)["caption_prompt"]
         model_client = ModelClient(
@@ -541,6 +676,8 @@ def caption_task(task_id: int) -> None:
         total = max(1, len(images))
 
         for idx, image in enumerate(images):
+            if _check_cancel(db, task, task_id, cancel_version):
+                return
             if not image.crop_path:
                 continue
             try:
@@ -560,6 +697,8 @@ def caption_task(task_id: int) -> None:
             task.progress = 80 + int(((idx + 1) / total) * 10)
             task.message = f"提示词进度 {idx+1}/{total}"
             db.commit()
+        if _check_cancel(db, task, task_id, cancel_version):
+            return
         task.stage = TaskStage.PACKAGING
         task.message = "打包训练集..."
         db.commit()
@@ -623,8 +762,23 @@ def caption_task(task_id: int) -> None:
 
 def run_full_pipeline(task_id: int) -> None:
     """One-click flow from unpack -> dedup -> crop -> caption."""
+    cancel_version = get_cancel_version()
+    if _should_cancel(task_id, cancel_version):
+        return
     prepare_task(task_id)
-    dedup_task(task_id, auto_continue=True)
+    if _should_cancel(task_id, cancel_version):
+        return
+    dedup_params = None
+    db = SessionLocal()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if task and task.config:
+            dedup_params = task.config.get("dedup_params")
+    except Exception:
+        dedup_params = None
+    finally:
+        db.close()
+    dedup_task(task_id, auto_continue=True, dedup_params=dedup_params)
 
 
 @celery_app.task(name="process_task")

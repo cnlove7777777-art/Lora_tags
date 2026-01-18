@@ -35,6 +35,7 @@ class Settings(BaseSettings):
 
     # Processing configuration
     MAX_UPLOAD_MB: int = 2048
+    MAX_PARALLEL_TASKS: int = 5
     PHASH_THRESHOLD: int = 6
     KEEP_PER_CLUSTER: int = 2
     PREVIEW_MAX_SIDE: int = 1280

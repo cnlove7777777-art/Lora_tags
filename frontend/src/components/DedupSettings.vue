@@ -85,14 +85,14 @@
         <div class="form-hint">边界框大小的容差，用于判断两个边界框大小是否相似</div>
       </el-form-item>
     
-      <el-form-item label="??????">
+      <el-form-item label="每簇保留数量">
         <el-input-number
           v-model="dedupSettingsForm.keep_per_cluster"
           :min="1"
           :max="5"
           :step="1"
         />
-        <div class="form-hint">??1??????????</div>
+        <div class="form-hint">设为1只保留每簇最清晰一张</div>
       </el-form-item>
     </el-form>
     <div class="dialog-footer">
@@ -142,10 +142,10 @@ const saveDedupSettings = async () => {
     const updated = await updateProcessingSettings({ dedup_params: dedupSettingsForm.value })
     dedupSettingsForm.value = { ...dedupSettingsForm.value, ...updated.dedup_params }
     emit('save')
-    ElMessage.success('???????')
+    ElMessage.success('去重参数已保存')
   } catch (error) {
     console.error(error)
-    ElMessage.error('????????')
+    ElMessage.error('保存失败，请稍后重试')
   } finally {
     loading.value = false
   }

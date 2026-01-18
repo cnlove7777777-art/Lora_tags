@@ -91,7 +91,7 @@
                 <el-icon>
                   <Folder />
                 </el-icon>
-                选择文件夹
+                选择父文件夹
               </el-button>
               <input
                 ref="folderInputRef"
@@ -101,14 +101,14 @@
                 class="folder-input"
                 @change="handleFolderChange"
               />
-              <div class="method-hint">选择包含 .zip 文件的文件夹</div>
+              <div class="method-hint">选择父文件夹，自动按一级子文件夹分任务（仅处理图片）</div>
             </div>
           </div>
           <div class="selected-hint" v-if="uploadingFiles.length">
-            <div class="selected-title">已选压缩包 (可展开文件浏览?)</div>
+            <div class="selected-title">已选上传项 (文件夹/ZIP)</div>
             <ul>
               <li v-for="(file, idx) in uploadingFiles" :key="idx">
-                {{ file.relativePath || file.file.name }}
+                {{ formatItemLabel(file) }}
               </li>
             </ul>
           </div>
@@ -122,6 +122,7 @@
             >
               <div>
                 <div>支持上传多个 .zip 文件，每个文件对应一个任务</div>
+                <div>选择父文件夹时，自动按一级子文件夹拆分为任务（忽略视频，仅处理图片）</div>
                 <div>自动去重，每簇保留最多{{ keepPerCluster }}张清晰度最高的图片</div>
                 <div>并发上传限制：{{ concurrentLimit }} 个文件</div>
               </div>
@@ -140,8 +141,8 @@
         <div class="task-board">
           <div class="board-header">
             <div>
-              <div class="board-title">压缩包列表 / 处理进度</div>
-              <div class="board-sub">解压后按文件夹展示，可单列操作或一键完成</div>
+              <div class="board-title">任务列表 / 处理进度</div>
+              <div class="board-sub">支持 ZIP 与文件夹任务，按任务展示处理进度</div>
             </div>
             <el-button text :icon="Refresh" @click="loadTaskBoard" :loading="loadingTasks">刷新</el-button>
           </div>
@@ -184,7 +185,7 @@
               </div>
             </div>
           </div>
-          <el-empty v-else description="还没有任务，先上传ZIP 吧" />
+          <el-empty v-else description="还没有任务，先上传 ZIP 或选择文件夹吧" />
         </div>
         <div class="log-panel">
           <div class="log-panel-header">
@@ -259,16 +260,17 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted, onBeforeUnmount, watch } from 'vue'
+import { ref, reactive, onMounted, onBeforeUnmount, watch, onActivated } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { UploadFilled, Folder, VideoPlay, Refresh } from '@element-plus/icons-vue'
 import UploadQueue from '../components/UploadQueue.vue'
-import type { UploadFile } from '../types/upload'
+import type { UploadItem } from '../types/upload'
 import type { Task, TaskImage } from '../types/task'
 import type { LogEntry } from '../services/api'
 import {
   uploadTask,
+  uploadFolderTask,
   getModels,
   getTasks,
   triggerDedup,
@@ -281,6 +283,8 @@ import {
   getLogs
 } from '../services/api'
 
+defineOptions({ name: 'UploadView' })
+
 const router = useRouter()
 const route = useRoute()
 
@@ -292,8 +296,8 @@ const formData = reactive({
   tag_model: ''
 })
 
-const uploadingFiles = ref<UploadFile[]>([])
-const pendingFiles = ref<UploadFile[]>([])
+const uploadingFiles = ref<UploadItem[]>([])
+const pendingFiles = ref<UploadItem[]>([])
 const concurrentLimit = 2
 const keepPerCluster = ref(2)
 const logs = ref<LogEntry[]>([])
@@ -392,10 +396,50 @@ const loadTaskBoard = async () => {
   }
 }
 
+const imageExts = new Set(['.jpg', '.jpeg', '.png', '.webp'])
+
+const getRelativePath = (file: File) => {
+  return (file as any).webkitRelativePath || file.name
+}
+
+const getGroupName = (relativePath: string) => {
+  const cleaned = relativePath.replace(/\\/g, '/')
+  const parts = cleaned.split('/').filter(Boolean)
+  if (parts.length <= 1) return ''
+  const dirs = parts.slice(0, -1)
+  if (dirs.length >= 2) return dirs[1]
+  return dirs[0] || ''
+}
+
+const isImageFile = (file: File) => {
+  const name = file.name.toLowerCase()
+  const dotIndex = name.lastIndexOf('.')
+  if (dotIndex === -1) return false
+  return imageExts.has(name.slice(dotIndex))
+}
+
+const buildUploadItem = (kind: 'zip' | 'folder', files: File[], displayName: string): UploadItem => {
+  const totalSize = files.reduce((sum, file) => sum + file.size, 0)
+  const lastModified = files.reduce((latest, file) => Math.max(latest, file.lastModified || 0), 0)
+  return {
+    kind,
+    files,
+    displayName,
+    totalSize,
+    fileCount: files.length,
+    lastModified,
+    taskId: undefined,
+    progress: 0,
+    status: 'pending',
+    message: ''
+  }
+}
+
 const handleFileChange = (file: any) => {
   const newFile = file.raw as File
   if (newFile) {
-    addFilesToQueue([newFile])
+    const item = buildUploadItem('zip', [newFile], newFile.name)
+    addItemsToQueue([item])
   }
 }
 
@@ -406,23 +450,38 @@ const selectFolder = () => {
 const handleFolderChange = (event: Event) => {
   const input = event.target as HTMLInputElement
   const files = Array.from(input.files || [])
-  const zipFiles = files.filter(file => file.name.toLowerCase().endsWith('.zip'))
-  addFilesToQueue(zipFiles)
+  const groups = new Map<string, File[]>()
+
+  files.forEach(file => {
+    if (!isImageFile(file)) return
+    const relativePath = getRelativePath(file)
+    const folderName = getGroupName(relativePath) || 'folder'
+    if (!groups.has(folderName)) {
+      groups.set(folderName, [])
+    }
+    groups.get(folderName)?.push(file)
+  })
+
+  if (!groups.size) {
+    ElMessage.warning('所选文件夹中未找到图片文件')
+    input.value = ''
+    return
+  }
+
+  const items: UploadItem[] = []
+  groups.forEach((groupFiles, folderName) => {
+    if (groupFiles.length) {
+      items.push(buildUploadItem('folder', groupFiles, folderName))
+    }
+  })
+
+  addItemsToQueue(items)
   input.value = ''
 }
 
-const addFilesToQueue = (files: File[]) => {
-  const newUploadFiles: UploadFile[] = files.map(file => ({
-    file,
-    relativePath: (file as any).webkitRelativePath || file.name,
-    taskId: undefined,
-    progress: 0,
-    status: 'pending',
-    message: ''
-  }))
-
-  pendingFiles.value.push(...newUploadFiles)
-  uploadingFiles.value.push(...newUploadFiles)
+const addItemsToQueue = (items: UploadItem[]) => {
+  pendingFiles.value.push(...items)
+  uploadingFiles.value.push(...items)
   startUpload()
 }
 
@@ -444,34 +503,55 @@ const startUpload = async () => {
   const nextFileIndex = uploadingFiles.value.findIndex(f => f.status === 'pending')
   if (nextFileIndex === -1) return
 
-  const file = uploadingFiles.value[nextFileIndex]
-  file.status = 'uploading'
+  const item = uploadingFiles.value[nextFileIndex]
+  item.status = 'uploading'
+
+  const updateProgress = (progressEvent: any) => {
+    const total = progressEvent.total || item.totalSize
+    const percentCompleted = total ? Math.min(100, Math.round((progressEvent.loaded * 100) / total)) : 0
+    item.progress = percentCompleted
+  }
 
   try {
-    const task = await uploadTask(
-      file.file,
-      formData.focus_model || '',
-      formData.tag_model || '',
-      (progressEvent) => {
-        const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total)
-        file.progress = percentCompleted
+    let task: Task
+    if (item.kind === 'folder') {
+      if (!item.files.length) {
+        throw new Error('没有可上传的文件')
       }
-    )
+      task = await uploadFolderTask(
+        item.displayName,
+        item.files,
+        formData.focus_model || '',
+        formData.tag_model || '',
+        updateProgress
+      )
+    } else {
+      const file = item.files[0]
+      if (!file) {
+        throw new Error('缺少上传文件')
+      }
+      task = await uploadTask(
+        file,
+        formData.focus_model || '',
+        formData.tag_model || '',
+        updateProgress
+      )
+    }
 
-    file.status = 'success'
-    file.progress = 100
-    file.taskId = task.id
+    item.status = 'success'
+    item.progress = 100
+    item.taskId = task.id
     await loadTaskBoard()
     startUpload()
   } catch (error: any) {
-    file.status = 'error'
-    file.message = error.response?.data?.detail || '上传失败，请重试'
+    item.status = 'error'
+    item.message = error.response?.data?.detail || error.message || '上传失败，请重试'
     startUpload()
   }
 }
 
-const handleRetryUpload = (fileToRetry: UploadFile) => {
-  const fileIndex = uploadingFiles.value.findIndex(f => f.file.name === fileToRetry.file.name)
+const handleRetryUpload = (fileToRetry: UploadItem) => {
+  const fileIndex = uploadingFiles.value.findIndex(f => f === fileToRetry)
   if (fileIndex !== -1) {
     const file = uploadingFiles.value[fileIndex]
     file.status = 'pending'
@@ -485,6 +565,13 @@ const handleRetryUpload = (fileToRetry: UploadFile) => {
 const handleClearQueue = () => {
   uploadingFiles.value = []
   pendingFiles.value = []
+}
+
+const formatItemLabel = (item: UploadItem) => {
+  if (item.kind === 'folder') {
+    return `${item.displayName} (${item.fileCount})`
+  }
+  return item.displayName
 }
 
 const formatTime = (timeStr: string) => {
@@ -609,6 +696,7 @@ onMounted(() => {
     boardTimer.value = window.setInterval(loadTaskBoard, 6000)
   }
   logsTimer.value = window.setInterval(loadLogs, 5000)
+  document.addEventListener('visibilitychange', handleVisibilityChange)
 })
 
 // Watch for route changes to pause/resume board timer
@@ -630,6 +718,21 @@ onBeforeUnmount(() => {
   if (logsTimer.value) {
     clearInterval(logsTimer.value)
   }
+  document.removeEventListener('visibilitychange', handleVisibilityChange)
+})
+
+const handleVisibilityChange = () => {
+  if (!document.hidden) {
+    startUpload()
+    loadTaskBoard()
+    loadLogs()
+  }
+}
+
+onActivated(() => {
+  startUpload()
+  loadTaskBoard()
+  loadLogs()
 })
 </script>
 
